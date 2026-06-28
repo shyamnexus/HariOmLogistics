@@ -13,6 +13,7 @@ import pandas as pd
 from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
@@ -24,6 +25,8 @@ TRIP_DATA_START = 4
 TRIP_DATA_END = 502
 PAY_DATA_START = 4
 PAY_DATA_END = 203
+MASTER_ROW_MAX = 500
+TRUCK_TABLE_END = 150
 TRIP_RANGE = f"'Trip Log'!$A${TRIP_DATA_START}:$T${TRIP_DATA_END}"
 
 # Styles
@@ -58,14 +61,73 @@ def style_title(ws, cell_ref: str, text: str) -> None:
     ws[cell_ref].font = TITLE_FONT
 
 
-def add_list_validation(ws, cell_range: str, list_formula: str) -> None:
-    dv = DataValidation(type="list", formula1=list_formula, allow_blank=True)
+def add_list_validation(ws, cell_range: str, defined_name: str) -> None:
+    """Add a dropdown list backed by a workbook defined name (most reliable in Excel)."""
+    formula = defined_name if defined_name.startswith("=") else f"={defined_name}"
+    dv = DataValidation(type="list", formula1=formula, allow_blank=True)
+    dv.showDropDown = False  # Excel quirk: False = show the dropdown arrow
+    dv.showInputMessage = True
+    dv.showErrorMessage = True
     dv.error = "Please choose a value from the dropdown list."
     dv.errorTitle = "Invalid entry"
-    dv.prompt = "Select from list"
+    dv.prompt = "Click the arrow and select from the list"
     dv.promptTitle = "Dropdown"
     ws.add_data_validation(dv)
     dv.add(cell_range)
+
+
+def lookup_truck(truck_cell: str, result_col: str, fallback: str) -> str:
+    """INDEX/MATCH lookup — works in Excel 2007+ (unlike XLOOKUP)."""
+    return (
+        f'=IF({truck_cell}="","",IFERROR('
+        f"INDEX('Master Data'!${result_col}$5:${result_col}${TRUCK_TABLE_END},"
+        f"MATCH({truck_cell},'Master Data'!$E$5:$E${TRUCK_TABLE_END},0)),"
+        f"{fallback}))"
+    )
+
+
+def trip_formulas(row: int) -> dict[int, str]:
+    """Return formula columns for one trip row."""
+    return {
+        6: lookup_truck(f"E{row}", "F", '""'),
+        9: f'=IF(OR(G{row}="",H{row}=""),"",G{row}*H{row})',
+        12: f'=IF(I{row}="","",I{row}-IF(J{row}="",0,J{row})-IF(K{row}="",0,K{row}))',
+        13: lookup_truck(f"E{row}", "G", "0"),
+        14: lookup_truck(f"E{row}", "H", "0"),
+        15: f'=IF(L{row}="","",L{row}-M{row}-N{row})',
+    }
+
+
+def create_defined_names(wb: openpyxl.Workbook) -> dict[str, str]:
+    """Register named ranges used by dropdowns. Dynamic OFFSET ranges grow as lists expand."""
+    names = {
+        "HL_Parties": (
+            f"OFFSET('Master Data'!$A$5,0,0,"
+            f"COUNTA('Master Data'!$A$5:$A${MASTER_ROW_MAX}),1)"
+        ),
+        "HL_Destinations": (
+            f"OFFSET('Master Data'!$C$5,0,0,"
+            f"COUNTA('Master Data'!$C$5:$C${MASTER_ROW_MAX}),1)"
+        ),
+        "HL_Trucks": (
+            f"OFFSET('Master Data'!$E$5,0,0,"
+            f"COUNTA('Master Data'!$E$5:$E${MASTER_ROW_MAX}),1)"
+        ),
+        "HL_Owners": (
+            f"OFFSET('Master Data'!$J$5,0,0,"
+            f"COUNTA('Master Data'!$J$5:$J${MASTER_ROW_MAX}),1)"
+        ),
+        "HL_Pahunch": "'Master Data'!$L$5:$L$5",
+        "HL_EPOD": "'Master Data'!$M$5:$M$6",
+        "HL_BillStatus": "'Master Data'!$N$5:$N$7",
+        "HL_BillRefs": (
+            f"OFFSET('Master Data'!$P$5,0,0,"
+            f"COUNTA('Master Data'!$P$5:$P${MASTER_ROW_MAX}),1)"
+        ),
+    }
+    for name, ref in names.items():
+        wb.defined_names.add(DefinedName(name=name, attr_text=ref))
+    return names
 
 
 def normalize_bill_ref(value) -> str | None:
@@ -98,6 +160,28 @@ def bill_ref_mapping() -> dict[str, str]:
     }
 
 
+def build_trucks_master(vd: pd.DataFrame) -> pd.DataFrame:
+    """Build truck master including every truck in the trip log."""
+    rows: list[dict] = []
+    for truck, sub in vd.groupby("Truck No", dropna=True):
+        truck_str = str(truck).strip()
+        if not truck_str:
+            continue
+        owners = sub["OWNER NAME"].dropna()
+        owner = owners.mode().iloc[0] if len(owners) else ""
+        comm = sub["commition"].dropna()
+        muns = sub["Munsiyana"].dropna()
+        rows.append(
+            {
+                "Truck No": truck_str,
+                "OWNER NAME": str(owner).strip() if pd.notna(owner) else "",
+                "commition": float(comm.median()) if len(comm) else 0,
+                "Munsiyana": float(muns.median()) if len(muns) else 0,
+            }
+        )
+    return pd.DataFrame(rows).sort_values(["OWNER NAME", "Truck No"], na_position="last")
+
+
 def load_source_data() -> dict:
     vd = pd.read_excel(SOURCE, sheet_name="vehicle details", header=1)
     vd.columns = [str(c).strip() for c in vd.columns]
@@ -113,12 +197,14 @@ def load_source_data() -> dict:
     bills.columns = [str(c).strip() for c in bills.columns]
     bills = bills[bills["BILL No."].notna()].copy()
 
-    trucks_df = (
-        vd[["Truck No", "OWNER NAME", "commition", "Munsiyana"]]
-        .dropna(subset=["Truck No", "OWNER NAME"])
-        .groupby(["Truck No", "OWNER NAME"], as_index=False)
-        .agg({"commition": "median", "Munsiyana": "median"})
-        .sort_values(["OWNER NAME", "Truck No"])
+    trucks_df = build_trucks_master(vd)
+
+    owners = sorted(
+        {
+            str(o).strip()
+            for o in pd.concat([vd["OWNER NAME"], trucks_df["OWNER NAME"]])
+            if pd.notna(o) and str(o).strip()
+        }
     )
 
     return {
@@ -128,7 +214,7 @@ def load_source_data() -> dict:
         "parties": sorted(vd["Sold To Party"].dropna().unique().tolist()),
         "destinations": sorted(vd["Destination"].dropna().unique().tolist()),
         "trucks": trucks_df,
-        "owners": sorted(vd["OWNER NAME"].dropna().unique().tolist()),
+        "owners": owners,
         "bill_refs": sorted(
             {r for x in vd["BILL No"].dropna().unique().tolist() if (r := normalize_bill_ref(x))},
             key=lambda x: (len(x), x),
@@ -165,7 +251,7 @@ def build_master_data(wb: openpyxl.Workbook, data: dict) -> openpyxl.worksheet.w
     dest_end = 4 + len(data["destinations"])
 
     # Trucks
-    ws["E3"] = "TRUCKS"
+    ws["E3"] = "TRUCKS (add owner & commission for new trucks)"
     ws["E3"].font = SUBTITLE_FONT
     ws["E3"].fill = SECTION_FILL
     headers = ["Truck No", "Owner", "Commission", "Munsiyana"]
@@ -233,14 +319,14 @@ def build_master_data(wb: openpyxl.Workbook, data: dict) -> openpyxl.worksheet.w
 
     ws.row_dimensions[2].hidden = True
     return ws, {
-        "party_range": f"'Master Data'!$A$5:$A${party_end}",
-        "dest_range": f"'Master Data'!$C$5:$C${dest_end}",
-        "truck_range": f"'Master Data'!$E$5:$E${truck_end}",
-        "owner_range": f"'Master Data'!$J$5:$J${owner_end}",
-        "pahunch_range": f"'Master Data'!$L$5:$L$5",
-        "epod_range": f"'Master Data'!$M$5:$M$6",
-        "bill_status_range": f"'Master Data'!$N$5:$N$7",
-        "bill_ref_range": f"'Master Data'!$P$5:$P${bill_ref_end}",
+        "party_range": "HL_Parties",
+        "dest_range": "HL_Destinations",
+        "truck_range": "HL_Trucks",
+        "owner_range": "HL_Owners",
+        "pahunch_range": "HL_Pahunch",
+        "epod_range": "HL_EPOD",
+        "bill_status_range": "HL_BillStatus",
+        "bill_ref_range": "HL_BillRefs",
         "truck_table_start": truck_start,
         "truck_table_end": truck_end,
         "owner_start": 5,
@@ -294,19 +380,14 @@ def build_trip_log(wb: openpyxl.Workbook, data: dict, ranges: dict) -> tuple:
         ws.cell(row=r, column=3, value=trip[2])  # Party
         ws.cell(row=r, column=4, value=trip[3])  # Destination
         ws.cell(row=r, column=5, value=trip[4])  # Truck
-        # Owner - formula
-        ws.cell(row=r, column=6, value=f"=IF(E{r}=\"\",\"\",XLOOKUP(E{r},'Master Data'!$E$5:$E${ranges['truck_table_end']},'Master Data'!$F$5:$F${ranges['truck_table_end']},\"\"))")
+        for col, formula in trip_formulas(r).items():
+            ws.cell(row=r, column=col, value=formula)
         ws.cell(row=r, column=7, value=float(trip[6]) if pd.notna(trip[6]) else None)
         ws.cell(row=r, column=8, value=float(trip[7]) if pd.notna(trip[7]) else None)
-        ws.cell(row=r, column=9, value=f"=IF(OR(G{r}=\"\",H{r}=\"\"),\"\",G{r}*H{r})")
         if pd.notna(trip[9]):
             ws.cell(row=r, column=10, value=float(trip[9]))
         if pd.notna(trip[10]):
             ws.cell(row=r, column=11, value=float(trip[10]))
-        ws.cell(row=r, column=12, value=f"=IF(I{r}=\"\",\"\",I{r}-IF(J{r}=\"\",0,J{r})-IF(K{r}=\"\",0,K{r}))")
-        ws.cell(row=r, column=13, value=f"=IF(E{r}=\"\",\"\",XLOOKUP(E{r},'Master Data'!$E$5:$E${ranges['truck_table_end']},'Master Data'!$G$5:$G${ranges['truck_table_end']},0))")
-        ws.cell(row=r, column=14, value=f"=IF(E{r}=\"\",\"\",XLOOKUP(E{r},'Master Data'!$E$5:$E${ranges['truck_table_end']},'Master Data'!$H$5:$H${ranges['truck_table_end']},0))")
-        ws.cell(row=r, column=15, value=f"=IF(L{r}=\"\",\"\",L{r}-M{r}-N{r})")
         if pd.notna(trip[15]) and str(trip[15]).strip().upper() == "YES":
             ws.cell(row=r, column=16, value="YES")
         if pd.notna(trip[16]):
@@ -323,12 +404,8 @@ def build_trip_log(wb: openpyxl.Workbook, data: dict, ranges: dict) -> tuple:
 
     # Formulas for empty template rows
     for r in range(first_data_row + len(trips), last_data_row + 1):
-        ws.cell(row=r, column=6, value=f"=IF(E{r}=\"\",\"\",XLOOKUP(E{r},'Master Data'!$E$5:$E${ranges['truck_table_end']},'Master Data'!$F$5:$F${ranges['truck_table_end']},\"\"))")
-        ws.cell(row=r, column=9, value=f"=IF(OR(G{r}=\"\",H{r}=\"\"),\"\",G{r}*H{r})")
-        ws.cell(row=r, column=12, value=f"=IF(I{r}=\"\",\"\",I{r}-IF(J{r}=\"\",0,J{r})-IF(K{r}=\"\",0,K{r}))")
-        ws.cell(row=r, column=13, value=f"=IF(E{r}=\"\",\"\",XLOOKUP(E{r},'Master Data'!$E$5:$E${ranges['truck_table_end']},'Master Data'!$G$5:$G${ranges['truck_table_end']},0))")
-        ws.cell(row=r, column=14, value=f"=IF(E{r}=\"\",\"\",XLOOKUP(E{r},'Master Data'!$E$5:$E${ranges['truck_table_end']},'Master Data'!$H$5:$H${ranges['truck_table_end']},0))")
-        ws.cell(row=r, column=15, value=f"=IF(L{r}=\"\",\"\",L{r}-M{r}-N{r})")
+        for col, formula in trip_formulas(r).items():
+            ws.cell(row=r, column=col, value=formula)
 
     # Money formatting
     for col in [8, 9, 10, 11, 12, 13, 14, 15, 19]:
@@ -359,7 +436,7 @@ def build_trip_log(wb: openpyxl.Workbook, data: dict, ranges: dict) -> tuple:
     )
 
     # Instructions
-    ws["A2"] = "Tip: Select Party, Destination & Truck from dropdowns. Owner, Commission & Balance auto-calculate. Yellow = PAHUNCH overdue. Red = Bill Ref missing."
+    ws["A2"] = "Tip: Use dropdown arrows on Party, Destination & Truck columns. Owner, Commission & Balance auto-fill when you pick a truck. Requires Microsoft Excel."
     ws["A2"].font = Font(italic=True, color="666666", size=10)
     ws.merge_cells("A2:T2")
 
@@ -739,8 +816,10 @@ def main() -> None:
     build_pump_sheet(wb, ranges)
     build_dashboard(wb, ranges)
     build_statements_sheet(wb)
+    create_defined_names(wb)
     set_sheet_order(wb)
 
+    wb.calculation.fullCalcOnLoad = True
     wb.save(OUTPUT)
     print(f"Saved: {OUTPUT}")
     print(f"Sheets: {wb.sheetnames}")
