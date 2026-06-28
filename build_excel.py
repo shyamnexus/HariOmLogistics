@@ -43,8 +43,61 @@ THIN_BORDER = Border(
     top=Side(style="thin", color="B4B4B4"),
     bottom=Side(style="thin", color="B4B4B4"),
 )
-ALERT_FILL = PatternFill("solid", fgColor="FFC7CE")
-WARN_FILL = PatternFill("solid", fgColor="FFEB9C")
+ALERT_FILL = PatternFill(patternType="solid", fgColor="FFC7CE", bgColor="FFC7CE")
+WARN_FILL = PatternFill(patternType="solid", fgColor="FFEB9C", bgColor="FFEB9C")
+STRIPE_FILL = PatternFill(patternType="solid", fgColor="F2F7FB", bgColor="F2F7FB")
+
+
+def add_trip_highlight_rules(ws, first_row: int, last_row: int) -> None:
+    """Color-code trip rows. Uses ISBLANK (not date checks) so rules work in all Excel versions."""
+    range_ref = f"A{first_row}:T{last_row}"
+    anchor = first_row
+
+    # Priority 1 — red: trip started but Bill Ref missing
+    red = FormulaRule(
+        formula=[f'AND($A{anchor}<>"",$G{anchor}<>"",ISBLANK($Q{anchor}))'],
+        fill=ALERT_FILL,
+        stopIfTrue=True,
+    )
+    red.priority = 1
+    ws.conditional_formatting.add(range_ref, red)
+
+    # Priority 2 — yellow: trip started but PAHUNCH missing
+    yellow = FormulaRule(
+        formula=[f'AND($A{anchor}<>"",$G{anchor}<>"",ISBLANK($P{anchor}))'],
+        fill=WARN_FILL,
+        stopIfTrue=True,
+    )
+    yellow.priority = 2
+    ws.conditional_formatting.add(range_ref, yellow)
+
+    # Priority 3 — subtle zebra stripes on data rows
+    stripe = FormulaRule(
+        formula=[f'AND(MOD(ROW(),2)=0,$A{anchor}<>"")'],
+        fill=STRIPE_FILL,
+        stopIfTrue=False,
+    )
+    stripe.priority = 3
+    ws.conditional_formatting.add(range_ref, stripe)
+
+
+def add_owner_ledger_highlight_rules(ws, first_row: int, last_row: int) -> None:
+    range_ref = f"A{first_row}:J{last_row}"
+    due_rule = FormulaRule(formula=[f'$H{first_row}>0'], fill=WARN_FILL, stopIfTrue=False)
+    due_rule.priority = 1
+    ws.conditional_formatting.add(range_ref, due_rule)
+
+
+def add_freight_bill_highlight_rules(ws, first_row: int, last_row: int) -> None:
+    range_ref = f"A{first_row}:L{last_row}"
+    anchor = first_row
+    epod_rule = FormulaRule(formula=[f'$G{anchor}="NO"'], fill=WARN_FILL, stopIfTrue=False)
+    epod_rule.priority = 1
+    ws.conditional_formatting.add(range_ref, epod_rule)
+
+    pending_rule = FormulaRule(formula=[f'$L{anchor}="PENDING"'], fill=ALERT_FILL, stopIfTrue=False)
+    pending_rule.priority = 2
+    ws.conditional_formatting.add(range_ref, pending_rule)
 
 
 def style_header_row(ws, row: int, max_col: int) -> None:
@@ -419,24 +472,14 @@ def build_trip_log(wb: openpyxl.Workbook, data: dict, ranges: dict) -> tuple:
     add_list_validation(ws, f"P{first_data_row}:P{last_data_row}", ranges["pahunch_range"])
     add_list_validation(ws, f"Q{first_data_row}:Q{last_data_row}", ranges["bill_ref_range"])
 
-    # Conditional formatting - missing PAHUNCH after 2 days
-    ws.conditional_formatting.add(
-        f"A{first_data_row}:T{last_data_row}",
-        FormulaRule(
-            formula=[f'AND($B{first_data_row}<>"", $P{first_data_row}="", $B{first_data_row}<TODAY()-2)'],
-            fill=WARN_FILL,
-        ),
-    )
-    ws.conditional_formatting.add(
-        f"A{first_data_row}:T{last_data_row}",
-        FormulaRule(
-            formula=[f'AND($Q{first_data_row}="", $I{first_data_row}<>"")'],
-            fill=ALERT_FILL,
-        ),
-    )
+    # Conditional formatting (must be after all cell writes)
+    add_trip_highlight_rules(ws, first_data_row, last_data_row)
 
     # Instructions
-    ws["A2"] = "Tip: Use dropdown arrows on Party, Destination & Truck columns. Owner, Commission & Balance auto-fill when you pick a truck. Requires Microsoft Excel."
+    ws["A2"] = (
+        "Yellow = PAHUNCH missing. Red = Bill Ref missing. "
+        "Pick Party, Destination & Truck from dropdown arrows. Requires Microsoft Excel."
+    )
     ws["A2"].font = Font(italic=True, color="666666", size=10)
     ws.merge_cells("A2:T2")
 
@@ -517,9 +560,11 @@ def build_freight_bills(wb, data, ranges, trip_first_row, trip_last_row) -> None
     add_list_validation(ws, f"G{first_row}:G{last_row}", ranges["epod_range"])
     add_list_validation(ws, f"L{first_row}:L{last_row}", ranges["bill_status_range"])
 
-    for col in [4, 5, 8, 9, 10, 11]:
+    for col in [3, 4, 5, 8, 9, 10, 11]:
         for r in range(first_row, last_row + 1):
             ws.cell(row=r, column=col).number_format = MONEY_FMT
+
+    add_freight_bill_highlight_rules(ws, first_row, last_row)
 
     # Summary
     summary_row = last_row + 3
@@ -593,11 +638,7 @@ def build_owner_ledger(wb, ranges, trip_first_row, trip_last_row, pay_first_row,
         for r in range(first_row, totals_row + 1):
             ws.cell(row=r, column=col).number_format = MONEY_FMT
 
-    # Highlight owners with net due > 0
-    ws.conditional_formatting.add(
-        f"A{first_row}:J{last_owner_row}",
-        FormulaRule(formula=[f'$H{first_row}>0'], fill=WARN_FILL),
-    )
+    add_owner_ledger_highlight_rules(ws, first_row, last_owner_row)
 
     widths = [16, 10, 14, 14, 14, 14, 14, 14, 14, 12]
     for i, w in enumerate(widths, start=1):
@@ -727,7 +768,7 @@ def build_dashboard(wb, ranges) -> None:
         "2. Freight Bills: set Trip Bill Ref (e.g. 11, 4 EPOD) — BILL AMOUNT auto-sums matching trips.",
         "3. Payments: always select Owner so Owner Ledger stays accurate.",
         "4. Master Data: add new parties, trucks, or destinations here — dropdowns update automatically.",
-        "5. Yellow rows = PAHUNCH overdue. Red rows = Bill Ref missing on a trip with freight.",
+        "5. Row colors on Trip Log: Yellow = PAHUNCH missing. Red = Bill Ref missing.",
     ]
     for i, tip in enumerate(tips, start=20):
         ws.cell(row=i, column=1, value=tip)
