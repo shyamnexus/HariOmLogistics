@@ -663,6 +663,56 @@ def build_dashboard(wb, ranges) -> None:
     ws.column_dimensions["D"].width = 18
 
 
+def build_statements_sheet(wb) -> None:
+    ws = wb.create_sheet("Statements")
+    ws.sheet_properties.tabColor = "548235"
+    style_title(ws, "A1", "HARIOM LOGISTICS — OWNER STATEMENT PDFs")
+    ws.merge_cells("A1:D1")
+    ws["A2"] = "Generate monthly PDF statements per truck owner from Trip Log and Payments data."
+    ws["A2"].font = Font(italic=True, color="666666", size=10)
+    ws.merge_cells("A2:D2")
+
+    ws["A4"] = "COMMAND"
+    ws["A4"].font = SUBTITLE_FONT
+    ws["B4"] = "python3 generate_owner_statements.py --month 2026-06"
+    ws["B4"].font = Font(name="Courier New", size=10)
+
+    commands = [
+        ("List available months", "python3 generate_owner_statements.py --list-months"),
+        ("Generate all owners (June 2026)", "python3 generate_owner_statements.py --month 2026-06"),
+        ("Generate one owner only", "python3 generate_owner_statements.py --month 2026-06 --owner VINEET"),
+        ("Custom output folder", "python3 generate_owner_statements.py --month 2026-06 --output ./statements"),
+    ]
+    row = 6
+    ws.cell(row=5, column=1, value="Option").font = SUBTITLE_FONT
+    ws.cell(row=5, column=2, value="Command").font = SUBTITLE_FONT
+    for label, cmd in commands:
+        ws.cell(row=row, column=1, value=label)
+        ws.cell(row=row, column=2, value=cmd)
+        ws.cell(row=row, column=2).font = Font(name="Courier New", size=9)
+        row += 1
+
+    ws.cell(row=row + 1, column=1, value="OUTPUT LOCATION").font = SUBTITLE_FONT
+    ws.cell(row=row + 2, column=1, value="PDFs are saved to: statements/YYYY-MM/YYYY-MM_OwnerName_statement.pdf")
+    ws.merge_cells(start_row=row + 2, start_column=1, end_row=row + 2, end_column=4)
+
+    ws.cell(row=row + 4, column=1, value="EACH PDF INCLUDES").font = SUBTITLE_FONT
+    bullets = [
+        "Trip details: LR, date, party, destination, truck, freight, commission, balance, PAHUNCH",
+        "Trip summary: totals for freight, commission, munsiyana, balance payable",
+        "Payments received that month",
+        "Account summary: balance payable − payments = net due",
+    ]
+    for i, text in enumerate(bullets, start=row + 5):
+        ws.cell(row=i, column=1, value=f"• {text}")
+        ws.merge_cells(start_row=i, start_column=1, end_row=i, end_column=4)
+
+    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["B"].width = 72
+    ws.column_dimensions["C"].width = 18
+    ws.column_dimensions["D"].width = 18
+
+
 def set_sheet_order(wb) -> None:
     order = [
         "Dashboard",
@@ -670,6 +720,7 @@ def set_sheet_order(wb) -> None:
         "Owner Ledger",
         "Freight Bills",
         "Payments",
+        "Statements",
         "Pump Account",
         "Master Data",
     ]
@@ -687,6 +738,7 @@ def main() -> None:
     build_owner_ledger(wb, ranges, trip_first, trip_last, pay_first, pay_last)
     build_pump_sheet(wb, ranges)
     build_dashboard(wb, ranges)
+    build_statements_sheet(wb)
     set_sheet_order(wb)
 
     wb.save(OUTPUT)
